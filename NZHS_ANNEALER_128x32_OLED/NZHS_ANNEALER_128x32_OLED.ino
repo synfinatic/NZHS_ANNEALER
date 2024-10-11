@@ -38,7 +38,7 @@
 #define RELOAD_TIME 5000 //time for user to load a new case in free run mode (ms)
 #define RELOAD_TIME_AUTO__FEED 2000 //time to feed case in auto feed mode (ms) - recommend leaving at 2000
 #define MIN_ANNEAL_TIME 2000 //min anneal time in ms
-#define MAX_ANNEAL_TIME 8000 //max anneal time in ms
+#define MAX_ANNEAL_TIME 10000 //max anneal time in ms
 #define LONG_PRESS_HOLD_TIME 15 //loop iterations for long button press e.g. 15 x 100ms = 1.5s press and hold
 #define LOOP_TIME 120  //ms per main loop iteration
 #define COOLDOWN_PERIOD 300000 //Cooling period in milliseconds
@@ -122,9 +122,9 @@ static const uint8_t g_TimeSetEncoderPinA   = 3;
 static const uint8_t g_TimeSetEncoderPinB   = 17; // AKA: A3
 #ifdef SERVO
 // Our encoder push button is which ever pin we don't use to drop cases
-static const uint8_t g_TimeSetSelectPin     = g_DropSolenoidPin;
+static const uint8_t g_TimeSetButtonPin     = g_DropSolenoidPin;
 #else
-static const uint8_t g_TimeSetSelectPin     = g_DropServoPin;
+static const uint8_t g_TimeSetButtonPin     = g_DropServoPin;
 #endif
 #else // USE_TIME_ENCODER
 // default values as shown on the PCB.  Used for no encoder
@@ -286,7 +286,7 @@ static tStateMachineStates g_SystemStatePrev = STATE_UNKNOWN;
 
 #ifdef USE_TIME_ENCODER
 long g_TimeEncoderValue = 33; // value is in tenths of a second, so 33 = 3.3sec
-Encoder TimeSet(g_TimeSetEncoderPinA, g_TimeSetEncoderPinB);
+Encoder TimeSetEncoder(g_TimeSetEncoderPinA, g_TimeSetEncoderPinB);
 #endif
 
 //-- function declarations------------------------------------------------
@@ -294,12 +294,7 @@ static tStateMachineStates updateSystemState(tStateMachineStates const state);
 static bool hasSystemStateChanged(void);
 static bool readStartButton(void);
 static bool readModeButton(void);
-#ifdef USE_TIME_ENCODER
-static long readEncoderValue(void);
-static bool readEncoderSelect(void);
-#else
 static bool readTimeButton(void);
-#endif
 static void turnAnnealerOn(void);
 static void turnAnnealerOff(void);
 static void openDropGate(void);
@@ -349,22 +344,12 @@ void setup()
   // Setup IO.
   pinMode(g_StartStopButtonPin, INPUT_PULLUP);
   pinMode(g_ModeButtonPin, INPUT_PULLUP);
-
-  #ifdef USE_TIME_ENCODER
-  pinMode(g_TimeSetSelectPin, INPUT_PULLUP);
-  
-  #ifdef SERVO
+#ifdef SERVO
   pinMode(g_DropServoPin,OUTPUT);
-  #else
+#else
   pinMode(g_DropSolenoidPin,OUTPUT);
-  #endif // SERVO
-
-  #else // USE_TIME_ENCODER
+#endif
   pinMode(g_TimeSetButtonPin, INPUT_PULLUP);
-  pinMode(g_DropSolenoidPin,OUTPUT);
-  pinMode(g_DropServoPin,OUTPUT);
-  #endif
-
   pinMode(g_AnnealerPin, OUTPUT);
   pinMode(g_StartStopLedPin, OUTPUT);
   pinMode(g_ModeLedPin, OUTPUT);
@@ -564,12 +549,7 @@ void loop()
   LoopStartTime = millis(); // capture time when loop starts
   start = readStartButton();
   modeKey = readModeButton();
-  #ifdef USE_TIME_ENCODER
-
-  #else
   timeKey = readTimeButton();
-  #endif
-
   temperature = readTemperature(0);
 
   /*temperature = sensors.getTempCByIndex(0);
@@ -673,7 +653,24 @@ void loop()
     case STATE_STOPPED:
     {
       updateSystemState(g_SystemState);
-      #ifndef USE_TIME_ENCODER
+
+      #ifdef USE_TIME_ENCODER
+      while (timeKey == 0) { // press select to leave
+        g_TimeEncoderValue = TimeSetEncoder.read();
+
+        // apply our sanity checks
+        if (g_TimeEncoderValue > (MAX_ANNEAL_TIME * 10)) {
+          g_TimeEncoderValue = MIN_ANNEAL_TIME * 10;
+        } else if (g_TimeEncoderValue < (MIN_ANNEAL_TIME * 10)) {
+          g_TimeEncoderValue = MIN_ANNEAL_TIME * 10;
+        }
+
+        // convert to ms
+        AnnealTime_ms = (uint16_t)g_TimeEncoderValue * 100;
+        annealTimeChanged = true;
+      }
+
+      #else // USE_TIME_ENCODER
       if(timeKey == 0)
       {
         timeKeyDuration = 0;
@@ -698,7 +695,7 @@ void loop()
         timeKeyDuration = 0;
         annealTimeChanged = true;
       }
-      #endif
+      #endif // USE_TIME_ENCODER
 
       display.clearDisplay();
       display.setCursor(0, 0);
@@ -1122,18 +1119,6 @@ static bool readModeButton(void)
   return !digitalRead(g_ModeButtonPin);
 }
 
-#ifdef USE_TIME_ENCODER
-// FIXME
-static long readEncoderValue(void) {
-    return 55;
-}
-
-// FIXME
-static bool readEncoderSelect(void) {
-  return false;
-}
-
-#else
 /*---------------------------------------------------------------------------*/
 /*! @brief      Read the up button state.
   @return       Start button state. 0 = low, else non-zero.
@@ -1142,7 +1127,6 @@ static bool readTimeButton(void)
 {
   return !digitalRead(g_TimeSetButtonPin);
 }
-#endif
 
 /*---------------------------------------------------------------------------*/
 /*! @brief      Turn the annealer on.
@@ -1165,10 +1149,11 @@ static void turnAnnealerOff(void)
 *//*-------------------------------------------------------------------------*/
 static void openDropGate(void)
 {
-
+    #ifdef SERVO
     analogWrite(g_DropServoPin,SERVO_OPEN_POSITION);
+    #else
     digitalWrite(g_DropSolenoidPin, HIGH);
-
+    #endif
 }
 
 /*---------------------------------------------------------------------------*/
@@ -1176,11 +1161,13 @@ static void openDropGate(void)
 *//*-------------------------------------------------------------------------*/
 static void closeDropGate(void)
 {
-
+    #ifdef SERVO
     analogWrite(g_DropServoPin,SERVO_CLOSE_POSITION); //IO9 PWM output
+    #else
     digitalWrite(g_DropSolenoidPin, LOW);
-
+    #endif
 }
+
 /*---------------------------------------------------------------------------*/
 /*! @brief      Turn the start/stop LED on.
 *//*-------------------------------------------------------------------------*/
