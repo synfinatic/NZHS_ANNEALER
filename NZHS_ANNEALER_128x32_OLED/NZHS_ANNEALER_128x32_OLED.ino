@@ -14,17 +14,18 @@
 #include <EEPROM.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <Encoder.h>
 
 //-- macros---------------------------------------------------------------
-//#define DEBUG //defining DEBUG will remove the splash screen and enable serial debug info
-#define SERVO
+#define DEBUG //defining DEBUG will remove the splash screen and enable serial debug info
+#define SERVO // if not defined, we use the solenoid
 //                          Major Version
 //                          | Minor Version
 //                          | | LCD Type
 //                          | | |
 //                          | | |
 //                          | | |
-#define SOFTWARE_VERSION F("3.7.0")
+#define SOFTWARE_VERSION F("3.8.0")
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 32 // OLED display height, in pixels
 #define PSU_OVERCURRENT 12300 //12.3A
@@ -52,6 +53,7 @@
 #define CASE_FEEDER_HOPPER_START 70*STEPPER_MICROSTEPS*STEPPER_SCALING_FACTOR
 #define CASE_FEEDER_HOPPER_END 130*STEPPER_MICROSTEPS*STEPPER_SCALING_FACTOR
 
+#define USE_TIME_ENCODER // Swap Mode<->Time buttons and add A3+Mode for a time encoder
 #define MODE_KEY_USED  //defines the use of the mode key input. comment out this #define to disable mode selection and reassign the mode key input to force case drop in the event of a stuck case
 #define SHOW_CASE_COUNT //This enables the display of the total number of cases annealed since powerup. Comment this out if you don't want to see the cases annealed counter.
 
@@ -97,9 +99,10 @@ typedef enum ModeList
   MODE_AUTOMATIC,
 } ModeList;
 
+
+
 //--global constant declarations-----------------------------------------
 static const uint8_t g_StartStopButtonPin   = 2;
-static const uint8_t g_ModeButtonPin        = 3;
 static const uint8_t g_AnnealerPin          = 6;
 static const uint8_t g_DropServoPin         = 9;
 static const uint8_t g_FeederStepPin       = 12;
@@ -108,10 +111,26 @@ static const uint8_t g_CoolingFanPin        = 7;
 static const uint8_t g_ModeLedPin           = 11;
 static const uint8_t g_PsuCurrentAdcPin     = 0;
 static const uint8_t g_DropSolenoidPin      = 10;
-static const uint8_t g_TimeSetButtonPin     = 16;
 static const uint8_t g_FeederDirPin         = 13;
 static const uint8_t g_FeederStepperEnPin   = 5;
 
+#ifdef USE_TIME_ENCODER
+// Swap the Mode & Time buttons for the time Encoder
+static const uint8_t g_ModeButtonPin        = 16;
+// static const uint8_t g_TimeSetButtonPin     = 3; // not used
+static const uint8_t g_TimeSetEncoderPinA   = 3;
+static const uint8_t g_TimeSetEncoderPinB   = 17; // AKA: A3
+#ifdef SERVO
+// Our encoder push button is which ever pin we don't use to drop cases
+static const uint8_t g_TimeSetSelectPin     = g_DropSolenoidPin;
+#else
+static const uint8_t g_TimeSetSelectPin     = g_DropServoPin;
+#endif
+#else // USE_TIME_ENCODER
+// default values as shown on the PCB.  Used for no encoder
+static const uint8_t g_ModeButtonPin        = 3;
+static const uint8_t g_TimeSetButtonPin     = 16;
+#endif
 
  // custom startup image, 128x32px
 const unsigned char anneallogo [] PROGMEM = {
@@ -265,12 +284,22 @@ static tStateMachineStates g_SystemStatePrev = STATE_UNKNOWN;
   static ModeList CurrentMode = MODE_FREE_RUN; //mode key is not used so set default mode to free run
 #endif
 
+#ifdef USE_TIME_ENCODER
+long g_TimeEncoderValue = 33; // value is in tenths of a second, so 33 = 3.3sec
+Encoder TimeSet(g_TimeSetEncoderPinA, g_TimeSetEncoderPinB);
+#endif
+
 //-- function declarations------------------------------------------------
 static tStateMachineStates updateSystemState(tStateMachineStates const state);
 static bool hasSystemStateChanged(void);
 static bool readStartButton(void);
 static bool readModeButton(void);
-static bool readUpButton(void);
+#ifdef USE_TIME_ENCODER
+static long readEncoderValue(void);
+static bool readEncoderSelect(void);
+#else
+static bool readTimeButton(void);
+#endif
 static void turnAnnealerOn(void);
 static void turnAnnealerOff(void);
 static void openDropGate(void);
@@ -320,13 +349,26 @@ void setup()
   // Setup IO.
   pinMode(g_StartStopButtonPin, INPUT_PULLUP);
   pinMode(g_ModeButtonPin, INPUT_PULLUP);
+
+  #ifdef USE_TIME_ENCODER
+  pinMode(g_TimeSetSelectPin, INPUT_PULLUP);
+  
+  #ifdef SERVO
+  pinMode(g_DropServoPin,OUTPUT);
+  #else
+  pinMode(g_DropSolenoidPin,OUTPUT);
+  #endif // SERVO
+
+  #else // USE_TIME_ENCODER
   pinMode(g_TimeSetButtonPin, INPUT_PULLUP);
+  pinMode(g_DropSolenoidPin,OUTPUT);
+  pinMode(g_DropServoPin,OUTPUT);
+  #endif
+
   pinMode(g_AnnealerPin, OUTPUT);
   pinMode(g_StartStopLedPin, OUTPUT);
   pinMode(g_ModeLedPin, OUTPUT);
   pinMode(g_CoolingFanPin, OUTPUT);
-  pinMode(g_DropSolenoidPin, OUTPUT);
-  pinMode(g_DropServoPin,OUTPUT);
   pinMode(g_FeederStepPin,OUTPUT);
   pinMode(g_FeederDirPin,OUTPUT);
   pinMode(g_FeederStepperEnPin,OUTPUT);
@@ -500,9 +542,9 @@ void loop()
 
   static bool modeKey;
   static bool modeKeyPrev;
-  static bool upKey=0;
-  static bool upKeyPrev=0;
-  static uint8_t upKeyDuration = 0x00;
+  static bool timeKey=0;
+  static bool timeKeyPrev=0;
+  static uint8_t timeKeyDuration = 0x00;
   static uint8_t modeKeyDuration = 0x00;
   static bool FanIsOn = false;
   static bool annealTimeChanged = false;
@@ -522,7 +564,11 @@ void loop()
   LoopStartTime = millis(); // capture time when loop starts
   start = readStartButton();
   modeKey = readModeButton();
-  upKey = readUpButton();
+  #ifdef USE_TIME_ENCODER
+
+  #else
+  timeKey = readTimeButton();
+  #endif
 
   temperature = readTemperature(0);
 
@@ -627,30 +673,32 @@ void loop()
     case STATE_STOPPED:
     {
       updateSystemState(g_SystemState);
-      if(upKey == 0)
+      #ifndef USE_TIME_ENCODER
+      if(timeKey == 0)
       {
-        upKeyDuration = 0;
+        timeKeyDuration = 0;
       }
       else
       {
-        upKeyDuration = upKeyDuration + 1;
+        timeKeyDuration = timeKeyDuration + 1;
       }
       if(AnnealTime_ms > MAX_ANNEAL_TIME) // too long
       {
         AnnealTime_ms = MIN_ANNEAL_TIME;
         annealTimeChanged = true;
       }
-      if (upKey && !upKeyPrev) //up key pressed?
+      if (timeKey && !timeKeyPrev) //up key pressed?
       {
         AnnealTime_ms = AnnealTime_ms + 100;
         annealTimeChanged = true;
       }
-      if (upKeyDuration >= LONG_PRESS_HOLD_TIME) //long press resets time to 2s
+      if (timeKeyDuration >= LONG_PRESS_HOLD_TIME) //long press resets time to 2s
       {
         AnnealTime_ms = MIN_ANNEAL_TIME;
-        upKeyDuration = 0;
+        timeKeyDuration = 0;
         annealTimeChanged = true;
       }
+      #endif
 
       display.clearDisplay();
       display.setCursor(0, 0);
@@ -980,7 +1028,7 @@ void loop()
   }
   startPrev = start;
   modeKeyPrev = modeKey;
-  upKeyPrev = upKey;
+  timeKeyPrev = timeKey;
 
   if(cooling_timer > millis())
   {
@@ -1073,14 +1121,28 @@ static bool readModeButton(void)
 {
   return !digitalRead(g_ModeButtonPin);
 }
+
+#ifdef USE_TIME_ENCODER
+// FIXME
+static long readEncoderValue(void) {
+    return 55;
+}
+
+// FIXME
+static bool readEncoderSelect(void) {
+  return false;
+}
+
+#else
 /*---------------------------------------------------------------------------*/
 /*! @brief      Read the up button state.
   @return       Start button state. 0 = low, else non-zero.
 *//*-------------------------------------------------------------------------*/
-static bool readUpButton(void)
+static bool readTimeButton(void)
 {
-  return !digitalRead(A2);
+  return !digitalRead(g_TimeSetButtonPin);
 }
+#endif
 
 /*---------------------------------------------------------------------------*/
 /*! @brief      Turn the annealer on.
